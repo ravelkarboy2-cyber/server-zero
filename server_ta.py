@@ -53,7 +53,7 @@ cache_store = {
 
 def fetch_history_with_cache():
     now = time.time()
-    # Jika cache kosong atau sudah kadaluarsa, query Neon DB
+    # Jika cache kosong atau sudah kadaluarsa (> 5s), query Neon DB
     if cache_store['history_data'] is None or (now - cache_store['last_fetch']) > cache_store['ttl_seconds']:
         records = SensorData.query.order_by(SensorData.id.desc()).limit(20).all()
         records.reverse()
@@ -239,6 +239,11 @@ DASHBOARD_HTML = """
 @app.route('/')
 def home():
     return render_template_string(DASHBOARD_HTML)
+
+# ENDPOINT UPTIMEROBOT: MENCEGAH RENDER SLEEP TANPA SENTUH DATABASE
+@app.route('/ping', methods=['GET'])
+def keep_alive():
+    return jsonify({'status': 'alive', 'message': 'Server Zero is Awake!'}), 200
 
 @app.route('/api/monitoring', methods=['POST'])
 def receive_monitoring():
