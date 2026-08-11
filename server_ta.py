@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 # =========================================================================
-# 1. KONFIGURASI DATABASE (Render Environment / Fallback Local SQLite)
+# 1. KONFIGURASI DATABASE & POOL PRE-PING (MEMBASMI ERROR MERAH SSL)
 # =========================================================================
 db_uri = os.environ.get('DATABASE_URL', 'sqlite:///local_sensor.db')
 if db_uri.startswith("postgres://"):
@@ -16,7 +16,16 @@ if db_uri.startswith("postgres://"):
 app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+# FIX ERROR MERAH: Cek koneksi sebelum query & auto-reconnect jika Neon DB tidur
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+}
+
 db = SQLAlchemy(app)
+
+# Track Kehadiran Pengguna (In-Memory Timestamp)
+last_viewer_time = 0
 
 # =========================================================================
 # 2. MODEL TABEL DATABASE
@@ -35,32 +44,28 @@ class SensorData(db.Model):
             'ph': self.ph,
             'tds': self.tds,
             'water_temp': self.water_temp,
-            'timestamp': (self.timestamp + timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S') # Conversion UTC ke WIB (+7)
+            'timestamp': (self.timestamp + timedelta(hours=7)).strftime('%Y-%m-%d %H:%M:%S')
         }
 
-# Inisialisasi Tabel
 with app.app_context():
     db.create_all()
 
 # =========================================================================
-# 3. IN-MEMORY CACHE (MENCEGAH SPAM QUERY KE NEON POSTGRESQL)
+# 3. IN-MEMORY CACHE (RAM FLASK)
 # =========================================================================
 cache_store = {
     'history_data': None,
     'last_fetch': 0,
-    'ttl_seconds': 5  # Cache berlaku selama 5 detik di RAM Flask
+    'ttl_seconds': 5
 }
 
 def fetch_history_with_cache():
     now = time.time()
-    # Jika cache kosong atau sudah kadaluarsa (> 5s), query Neon DB
     if cache_store['history_data'] is None or (now - cache_store['last_fetch']) > cache_store['ttl_seconds']:
         records = SensorData.query.order_by(SensorData.id.desc()).limit(20).all()
         records.reverse()
         cache_store['history_data'] = [r.to_dict() for r in records]
         cache_store['last_fetch'] = now
-    
-    # Jika cache masih hangat, langsung return dari RAM tanpa query DB
     return cache_store['history_data']
 
 def invalidate_cache():
@@ -68,7 +73,7 @@ def invalidate_cache():
     cache_store['last_fetch'] = 0
 
 # =========================================================================
-# 4. TEMPLATE DASHBOARD HTML (Chart.js + Log Table + Clear Button)
+# 4. TEMPLATE DASHBOARD HTML
 # =========================================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -177,7 +182,6 @@ DASHBOARD_HTML = """
                         chart.update();
                     }
 
-                    // Render Tabel Log
                     let html = '';
                     [...data].reverse().forEach(row => {
                         html += `<tr>
@@ -191,7 +195,6 @@ DASHBOARD_HTML = """
                     tableBody.innerHTML = html;
 
                 } else {
-                    // Tampilan Jika Database Kosong
                     document.getElementById('v-ph').innerText = '--';
                     document.getElementById('v-tds').innerText = '--';
                     document.getElementById('v-temp').innerText = '--';
@@ -226,7 +229,7 @@ DASHBOARD_HTML = """
         }
 
         updateData();
-        setInterval(updateData, 10000); // SLOW LIVING: Auto refresh tiap 10 detik (Hemat Kuota)
+        setInterval(updateData, 10000); // Polling 10 Detik
     </script>
 </body>
 </html>
@@ -240,10 +243,17 @@ DASHBOARD_HTML = """
 def home():
     return render_template_string(DASHBOARD_HTML)
 
-# ENDPOINT UPTIMEROBOT: MENCEGAH RENDER SLEEP TANPA SENTUH DATABASE
 @app.route('/ping', methods=['GET'])
 def keep_alive():
     return jsonify({'status': 'alive', 'message': 'Server Zero is Awake!'}), 200
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    global last_viewer_time
+    last_viewer_time = time.time() # CATAT BAHWA PENGGUNA SEDANG MEMBUKA WEB!
+    
+    history_data = fetch_history_with_cache()
+    return jsonify(history_data)
 
 @app.route('/api/monitoring', methods=['POST'])
 def receive_monitoring():
@@ -251,40 +261,36 @@ def receive_monitoring():
     if not data or not all(k in data for k in ('ph', 'tds', 'water_temp')):
         return jsonify({'status': 'error', 'message': 'Payload invalid'}), 400
     
-    # 1. Simpan Data Baru dari ESP32
-    new_data = SensorData(
-        ph=float(data['ph']),
-        tds=float(data['tds']),
-        water_temp=float(data['water_temp'])
-    )
-    db.session.add(new_data)
+    # CEK PRESENCE: Apakah ada pengguna membuka dashboard dalam 30 detik terakhir?
+    is_viewer_active = (time.time() - last_viewer_time) < 30
     
-    # 2. AUTO-PRUNING: Hapus otomatis data > 30 hari
-    cutoff = datetime.utcnow() - timedelta(days=30)
-    SensorData.query.filter(SensorData.timestamp < cutoff).delete()
-    
-    db.session.commit()
-    
-    # Invalidate RAM Cache agar UI dapat data terbaru
-    invalidate_cache()
-    
-    return jsonify({'status': 'success', 'message': 'Data tersimpan di Neon PostgreSQL'}), 201
-
-@app.route('/api/history', methods=['GET'])
-def get_history():
-    # Gunakan In-Memory Cache (RAM) agar Neon PostgreSQL tidak terbebani
-    history_data = fetch_history_with_cache()
-    return jsonify(history_data)
+    if is_viewer_active:
+        # MODE LIVE: Simpan ke Neon PostgreSQL
+        new_data = SensorData(
+            ph=float(data['ph']),
+            tds=float(data['tds']),
+            water_temp=float(data['water_temp'])
+        )
+        db.session.add(new_data)
+        
+        # Auto-Pruning Data > 30 Hari
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        SensorData.query.filter(SensorData.timestamp < cutoff).delete()
+        
+        db.session.commit()
+        invalidate_cache()
+        
+        return jsonify({'status': 'success', 'mode': 'LIVE', 'message': 'Data tersimpan di Neon DB'}), 201
+    else:
+        # MODE STANDBY (WEB DITUTUP): Abaikan simpan DB demi hemat kuota!
+        return jsonify({'status': 'standby', 'mode': 'IDLE', 'message': 'No active viewer. Data ignored to save Neon DB limit.'}), 200
 
 @app.route('/api/clear', methods=['POST'])
 def clear_all_data():
     try:
         num_deleted = db.session.query(SensorData).delete()
         db.session.commit()
-        
-        # Kosongkan RAM Cache seketika
         invalidate_cache()
-        
         return jsonify({'status': 'success', 'message': f'Berhasil mengosongkan database! ({num_deleted} baris terhapus)'}), 200
     except Exception as e:
         db.session.rollback()
